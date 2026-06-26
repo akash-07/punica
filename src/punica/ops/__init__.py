@@ -227,6 +227,49 @@ def add_lora_bgmv(
     f(tmp, x, wa_T_all, indicies, layer_idx, 1.0)
     f(y, tmp, wb_T_all, indicies, layer_idx, scale)
 
+def add_lora_with_sigma_bgmv(
+    y: torch.Tensor,
+    x: torch.Tensor,
+    wv_T_all: torch.Tensor,
+    wsigma_T_all: torch.Tensor,
+    wu_T_all: torch.Tensor,
+    indicies: torch.LongTensor,
+    indicies2: torch.LongTensor,
+    layer_idx: int,
+    scale: float,  
+):
+    """
+    Semantics:
+      y[i] += (
+          x[i].unsqueeze(0)
+          @ wv_T_all[indices[i], layer_idx, :, :].transpose(-1, -2)
+          @ wsigma_T_all[indices2[i], layer_idx, :, :].transpose(-1, -2)
+          @ wu_T_all[indices[i], layer_idx, :, :].transpose(-1, -2)
+          * scale
+        ).squeeze(0)
+
+    Args:
+      y: Shape: `[B, H2]`. Output vectors. Will be changed in-place.
+      x: Shape: `[B, H1]`. Input vectors.
+      wv_T_all: Shape: `[None, L, R, H1]`. All of the compressed & transposed LoRA V matrices.
+      wsigma_T_all: Shape: `[None, L, R, R]`. All of the compressed LoRA Sigma matrices.
+      wu_T_all: Shape: `[None, L, H2, R]`. All of the transposed LoRA U matrices.
+      indicies: Shape: `[B]`. Indices of the Us and V matrices.
+      indicies2: Shape: `[B]`. Indices of the Sigma matrices.
+      layer_idx: Layer index of LoRA weights.
+      scale: Scaling factor.
+    """
+
+    f = _kernels.dispatch_bgmv
+    device = x.device
+    dtype = x.dtype
+
+    r = wu_T_all.size(-1)
+    tmp = torch.zeros((x.size(0), r), dtype=dtype, device=device)
+    tmp_sigma = torch.zeros((x.size(0), r), dtype=dtype, device=device)
+    f(tmp, x, wv_T_all, indicies, layer_idx, 1.0)
+    f(tmp_sigma, tmp, wsigma_T_all, indicies2, layer_idx, 1.0)
+    f(y, tmp_sigma, wu_T_all, indicies, layer_idx, scale)
 
 def sgmv_cutlass(
     y: torch.Tensor,

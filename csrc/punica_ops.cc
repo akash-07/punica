@@ -267,6 +267,7 @@ inline bool launch_bgmv_kernel(T* Y, const T* X, const T* W,
   CASE_ONESIDE(T, wide, narrow)
 
     FOR_BGMV_WIDE_NARROW(CASE, _)
+    FOR_BGMV_NARROW_SQUARE(CASE_ONESIDE, _)
 #undef CASE
 #undef CASE_ONESIDE
     default:

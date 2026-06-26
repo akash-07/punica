@@ -182,13 +182,68 @@ __global__ void bgmv_expand_kernel(T* __restrict__ Y, const T* __restrict__ X,
   }
 }
 
+template <int feat, typename T>
+__global__ void bgmv_square_kernel(T* __restrict__ Y, const T* __restrict__ X,
+                                   const T* __restrict__ W,
+                                   const int64_t* __restrict__ indicies,
+                                   int64_t num_layers, int64_t layer_idx,
+                                   float scale) {
+  auto block = cg::this_thread_block();
+  constexpr size_t vec_size = 16 / sizeof(T);
+  constexpr size_t tx = feat / vec_size;
+  static_assert(feat % vec_size == 0);
+  constexpr size_t ty = 32 / tx;
+  static_assert(32 % tx == 0);
+  constexpr size_t tz = 4;
+  constexpr size_t outputs_per_block = ty * tz;
+
+  size_t tile_idx = blockIdx.x;
+  size_t batch_idx = blockIdx.y;
+  size_t out_idx = tile_idx * outputs_per_block + threadIdx.z * ty + threadIdx.y;
+  int64_t idx = indicies[batch_idx] * num_layers + layer_idx;
+
+  flashinfer::vec_t<T, vec_size> x_vec;
+  x_vec.load(X + batch_idx * feat + threadIdx.x * vec_size);
+
+  float sum = 0.f;
+  if (out_idx < feat) {
+    flashinfer::vec_t<T, vec_size> w_vec;
+    w_vec.load(W + (idx * feat + out_idx) * feat + threadIdx.x * vec_size);
+#pragma unroll
+    for (size_t i = 0; i < vec_size; ++i) {
+      sum += float(w_vec[i]) * float(x_vec[i]) * scale;
+    }
+  }
+
+  cg::thread_block_tile g = cg::tiled_partition<tx>(block);
+#pragma unroll
+  for (size_t offset = tx / 2; offset > 0; offset /= 2) {
+    sum += g.shfl_down(sum, offset);
+  }
+  sum = g.shfl(sum, 0);
+
+  if (threadIdx.x == 0 && out_idx < feat) {
+    Y[batch_idx * feat + out_idx] += sum;
+  }
+}
+
 template <int feat_in, int feat_out, typename T>
 void bgmv_kernel(T* __restrict__ Y, const T* __restrict__ X,
                  const T* __restrict__ W, const int64_t* __restrict__ indicies,
                  int64_t batch_size, int64_t num_layers, int64_t layer_idx,
                  float scale) {
-  size_t vec_size = 16 / sizeof(T);
-  if constexpr (feat_in < feat_out) {
+  constexpr size_t vec_size = 16 / sizeof(T);
+  if constexpr (feat_in == feat_out && feat_in <= 64) {
+    constexpr size_t tx = feat_in / vec_size;
+    constexpr size_t ty = 32 / tx;
+    constexpr size_t tz = 4;
+    constexpr size_t outputs_per_block = ty * tz;
+    dim3 nblks((feat_out + outputs_per_block - 1) / outputs_per_block,
+               batch_size);
+    dim3 nthrs(tx, ty, tz);
+    bgmv_square_kernel<feat_in>
+        <<<nblks, nthrs>>>(Y, X, W, indicies, num_layers, layer_idx, scale);
+  } else if constexpr (feat_in < feat_out) {
     size_t tx = feat_in / vec_size;
     size_t ty = 32 / tx;
     size_t tz = 4;
@@ -211,6 +266,8 @@ void bgmv_kernel(T* __restrict__ Y, const T* __restrict__ X,
       T* __restrict__ Y, const T* __restrict__ X, const T* __restrict__ W, \
       const int64_t* __restrict__ indicies, int64_t batch_size,            \
       int64_t num_layers, int64_t layer_idx, float scale);
+
+#define INST_BGMV_ONESIDE(T, feat_in, feat_out) INST_BGMV(feat_in, feat_out, T)
 
 #define INST_BGMV_TWOSIDE(T, narrow, wide) \
   INST_BGMV(narrow, wide, T)               \
