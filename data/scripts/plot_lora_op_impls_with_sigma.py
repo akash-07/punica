@@ -16,11 +16,13 @@ INPUT = Path("data/20260629-103211-with_sigma.jsonl")
 OUTPUT_DIR = Path("data/plots/20260629-103211-with_sigma")
 # POPULARITIES = ("bgmv", "uniform", "zipf:1.5", "bmm", "Nx8")
 POPULARITIES = ("bgmv", "uniform", "zipf:1.5", "bmm")
-KERNELS = ("gbmm", "sgmv", "sigma_bgmv")
+# KERNELS = ("gbmm", "sgmv", "sigma_bgmv")
+KERNELS = ("bgmv", "sgmv", "sigma_bgmv")
 LABELS = {
     "gbmm": "gbmm",
     "sgmv": "sgmv",
     "sigma_bgmv": "sigma_bgmv",
+    "bgmv": "bgmv",
 }
 POPULARITY_LABELS = {
     "bmm": "Identical",

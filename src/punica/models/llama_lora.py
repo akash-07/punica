@@ -12,6 +12,7 @@ from transformers.models.llama.modeling_llama import (
 )
 
 from punica.ops import (
+    add_lora_with_sigma_bgmv,
     add_lora_sgmv_custom_cutlass as add_lora,
     append_kv,
     batch_decode,
@@ -116,6 +117,163 @@ class BatchedLlamaLoraWeight:
         self.rank = weights[0].q.lora_rank
 
 
+class SigmaLoraWeight:
+    def __init__(
+        self,
+        num_layers: int,
+        in_features: int,
+        out_features: int,
+        lora_rank: int,
+        num_clusters: int,
+        num_sigma: int,
+        dtype: torch.dtype,
+        device: torch.device,
+    ):
+        self.wv_T = torch.zeros(
+            (num_clusters, num_layers, lora_rank, in_features),
+            dtype=dtype,
+            device=device,
+        )
+        self.wsigma_T = torch.zeros(
+            (num_sigma, num_layers, lora_rank, lora_rank),
+            dtype=dtype,
+            device=device,
+        )
+        self.wu_T = torch.zeros(
+            (num_clusters, num_layers, out_features, lora_rank),
+            dtype=dtype,
+            device=device,
+        )
+
+    @property
+    def lora_rank(self) -> int:
+        return self.wv_T.size(2)
+
+
+class LlamaSigmaLoraWeight:
+    def __init__(
+        self,
+        config: LlamaConfig,
+        lora_rank: int,
+        num_clusters: int,
+        num_sigma: int,
+        dtype: torch.dtype,
+        device: torch.device,
+    ):
+        kwargs = dict(
+            num_layers=config.num_hidden_layers,
+            lora_rank=lora_rank,
+            num_clusters=num_clusters,
+            num_sigma=num_sigma,
+            dtype=dtype,
+            device=device,
+        )
+        self.q = SigmaLoraWeight(
+            in_features=config.hidden_size,
+            out_features=config.hidden_size,
+            **kwargs,
+        )
+        self.k = SigmaLoraWeight(
+            in_features=config.hidden_size,
+            out_features=config.hidden_size,
+            **kwargs,
+        )
+        self.v = SigmaLoraWeight(
+            in_features=config.hidden_size,
+            out_features=config.hidden_size,
+            **kwargs,
+        )
+        self.o = SigmaLoraWeight(
+            in_features=config.hidden_size,
+            out_features=config.hidden_size,
+            **kwargs,
+        )
+        self.gate = SigmaLoraWeight(
+            in_features=config.hidden_size,
+            out_features=config.intermediate_size,
+            **kwargs,
+        )
+        self.up = SigmaLoraWeight(
+            in_features=config.hidden_size,
+            out_features=config.intermediate_size,
+            **kwargs,
+        )
+        self.down = SigmaLoraWeight(
+            in_features=config.intermediate_size,
+            out_features=config.hidden_size,
+            **kwargs,
+        )
+
+
+class BatchedLlamaSigmaLoraWeight:
+    def __init__(
+        self,
+        weight: LlamaSigmaLoraWeight,
+        cluster_indices: list[int],
+        sigma_indices: list[int],
+        device: torch.device,
+    ):
+        self.q = weight.q
+        self.k = weight.k
+        self.v = weight.v
+        self.o = weight.o
+        self.gate = weight.gate
+        self.up = weight.up
+        self.down = weight.down
+        self.cluster_indices = torch.tensor(
+            cluster_indices, dtype=torch.long, device=device
+        )
+        self.sigma_indices = torch.tensor(sigma_indices, dtype=torch.long, device=device)
+        self.rank = weight.q.lora_rank
+
+
+def add_sigma_lora(
+    y: torch.Tensor,
+    x: torch.Tensor,
+    weight: SigmaLoraWeight,
+    lora: BatchedLlamaSigmaLoraWeight,
+    layer_idx: int,
+):
+    add_lora_with_sigma_bgmv(
+        y,
+        x,
+        weight.wv_T,
+        weight.wsigma_T,
+        weight.wu_T,
+        lora.cluster_indices,
+        lora.sigma_indices,
+        layer_idx,
+        scale=1.0,
+    )
+
+
+def add_llama_lora(
+    y: torch.Tensor,
+    x: torch.Tensor,
+    weight,
+    lora,
+    layer_idx: int,
+):
+    if isinstance(lora, BatchedLlamaSigmaLoraWeight):
+        add_sigma_lora(
+            y, 
+            x, 
+            weight, 
+            lora, 
+            layer_idx
+        )
+    else:
+        add_lora(
+            y,
+            x,
+            weight.wa_ptr,
+            weight.wb_ptr,
+            lora.segment,
+            layer_idx,
+            lora.rank,
+        )
+
+
 class LlamaAttentionWithLora(nn.Module):
     def __init__(self, config: LlamaConfig, layer_idx: int):
         super().__init__()
@@ -149,7 +307,7 @@ class LlamaAttentionWithLora(nn.Module):
         blen: BatchLenInfo,
         prefill_kv: BatchedKvCache | None,
         decode_kv: BatchedKvCache | None,
-        lora: BatchedLlamaLoraWeight,
+        lora: BatchedLlamaLoraWeight | BatchedLlamaSigmaLoraWeight,
     ) -> torch.Tensor:
         torch.cuda.nvtx.range_push("qkv_proj")
         q_proj = self.q_proj(hidden_states)
@@ -158,33 +316,9 @@ class LlamaAttentionWithLora(nn.Module):
         torch.cuda.nvtx.range_pop()
 
         torch.cuda.nvtx.range_push("lora_qkv")
-        add_lora(
-            q_proj,
-            hidden_states,
-            lora.q.wa_ptr,
-            lora.q.wb_ptr,
-            lora.segment,
-            self.layer_idx,
-            lora.rank,
-        )
-        add_lora(
-            k_proj,
-            hidden_states,
-            lora.k.wa_ptr,
-            lora.k.wb_ptr,
-            lora.segment,
-            self.layer_idx,
-            lora.rank,
-        )
-        add_lora(
-            v_proj,
-            hidden_states,
-            lora.v.wa_ptr,
-            lora.v.wb_ptr,
-            lora.segment,
-            self.layer_idx,
-            lora.rank,
-        )
+        add_llama_lora(q_proj, hidden_states, lora.q, lora, self.layer_idx)
+        add_llama_lora(k_proj, hidden_states, lora.k, lora, self.layer_idx)
+        add_llama_lora(v_proj, hidden_states, lora.v, lora, self.layer_idx)
         torch.cuda.nvtx.range_pop()
 
         stack_attn_output = []
@@ -233,15 +367,7 @@ class LlamaAttentionWithLora(nn.Module):
         torch.cuda.nvtx.range_pop()
 
         torch.cuda.nvtx.range_push("lora_o")
-        add_lora(
-            o,
-            attn_outputs,
-            lora.o.wa_ptr,
-            lora.o.wb_ptr,
-            lora.segment,
-            self.layer_idx,
-            lora.rank,
-        )
+        add_llama_lora(o, attn_outputs, lora.o, lora, self.layer_idx)
         torch.cuda.nvtx.range_pop()
 
         return o
@@ -261,35 +387,19 @@ class LlamaMlpWithLora(nn.Module):
     def forward(
         self,
         x: torch.Tensor,
-        lora: BatchedLlamaLoraWeight,
+        lora: BatchedLlamaLoraWeight | BatchedLlamaSigmaLoraWeight,
     ) -> torch.Tensor:
         with torch.cuda.nvtx.range("gate_proj"):
             gate = self.gate_proj(x)
         with torch.cuda.nvtx.range("lora_gate"):
-            add_lora(
-                gate,
-                x,
-                lora.gate.wa_ptr,
-                lora.gate.wb_ptr,
-                lora.segment,
-                self.layer_idx,
-                lora.rank,
-            )
+            add_llama_lora(gate, x, lora.gate, lora, self.layer_idx)
         with torch.cuda.nvtx.range("gate_act"):
             gate = self.act_fn(gate)
 
         with torch.cuda.nvtx.range("up_proj"):
             up = self.up_proj(x)
         with torch.cuda.nvtx.range("lora_up"):
-            add_lora(
-                up,
-                x,
-                lora.up.wa_ptr,
-                lora.up.wb_ptr,
-                lora.segment,
-                self.layer_idx,
-                lora.rank,
-            )
+            add_llama_lora(up, x, lora.up, lora, self.layer_idx)
 
         with torch.cuda.nvtx.range("gate_up"):
             t = gate * up
@@ -297,15 +407,7 @@ class LlamaMlpWithLora(nn.Module):
         with torch.cuda.nvtx.range("down_proj"):
             down = self.down_proj(t)
         with torch.cuda.nvtx.range("lora_down"):
-            add_lora(
-                down,
-                t,
-                lora.down.wa_ptr,
-                lora.down.wb_ptr,
-                lora.segment,
-                self.layer_idx,
-                lora.rank,
-            )
+            add_llama_lora(down, t, lora.down, lora, self.layer_idx)
 
         return down
 
@@ -337,7 +439,7 @@ class LlamaDecoderLayerWithLora(nn.Module):
         blen: BatchLenInfo,
         prefill_kv: BatchedKvCache | None,
         decode_kv: BatchedKvCache | None,
-        lora: BatchedLlamaLoraWeight,
+        lora: BatchedLlamaLoraWeight | BatchedLlamaSigmaLoraWeight,
     ) -> torch.Tensor:
         residual = hidden_states
 
@@ -402,7 +504,7 @@ class LlamaModelWithLora(LlamaPreTrainedModel):
         blen: BatchLenInfo,
         prefill_kv: BatchedKvCache | None,
         decode_kv: BatchedKvCache | None,
-        lora: BatchedLlamaLoraWeight,
+        lora: BatchedLlamaLoraWeight | BatchedLlamaSigmaLoraWeight,
     ) -> torch.Tensor:
         torch.cuda.nvtx.range_push("embed")
         hidden_states = self.embed_tokens(input_ids)
@@ -435,7 +537,7 @@ class LlamaForCausalLMWithLora(LlamaPreTrainedModel):
         blen: BatchLenInfo,
         prefill_kv: BatchedKvCache | None,
         decode_kv: BatchedKvCache | None,
-        lora: BatchedLlamaLoraWeight,
+        lora: BatchedLlamaLoraWeight | BatchedLlamaSigmaLoraWeight,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         torch.cuda.nvtx.range_push("LlamaForCausalLMWithLora")
         hidden_states = self.model(input_ids, blen, prefill_kv, decode_kv, lora)

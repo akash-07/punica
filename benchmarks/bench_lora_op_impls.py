@@ -166,9 +166,9 @@ def _make_effective_lora_weights(
 
 @torch.inference_mode()
 def bench_lora_with_sigma_op_impls(f, rank: int):
-    bs_ = list(range(1, 65))
+    bs_ = list(range(1, 65, 7))
     sigma_pop_ = ["bmm", "bgmv", "uniform", "zipf:1.5"]
-    num_clusters_ = [1, 8, 32, 64]
+    num_clusters_ = [1, 64]
     h1 = 4096
     h2 = 11008
     r = rank
@@ -208,9 +208,7 @@ def bench_lora_with_sigma_op_impls(f, rank: int):
         pbar.set_postfix(setup)
 
         torch.manual_seed(0xABCDABCD987)
-        wv = torch.rand(
-            (num_clusters, num_layers, h1, r), dtype=dtype, device=device
-        )
+        wv = torch.rand((num_clusters, num_layers, h1, r), dtype=dtype, device=device)
         wsigma = torch.rand((num_sigma, num_layers, r, r), dtype=dtype, device=device)
         wu = torch.rand((num_clusters, num_layers, r, h2), dtype=dtype, device=device)
 
@@ -222,6 +220,8 @@ def bench_lora_with_sigma_op_impls(f, rank: int):
         )
         wa_t = [t.transpose(-1, -2) for t in wa]
         wb_t = [t.transpose(-1, -2) for t in wb]
+        wa_t_all = torch.stack(wa_t).contiguous()
+        wb_t_all = torch.stack(wb_t).contiguous()
         wa_ptr = torch.tensor(
             [t.data_ptr() for t in wa_t], dtype=torch.int64, device=device
         )
@@ -236,6 +236,9 @@ def bench_lora_with_sigma_op_impls(f, rank: int):
             cluster_indices, dtype=torch.long, device=device
         )
         sigma_indices_t = torch.tensor(sigma_indices, dtype=torch.long, device=device)
+        pair_indices_t = torch.tensor(
+            _repeat_indices(problem_sizes), dtype=torch.long, device=device
+        )
         s = torch.cumsum(
             torch.tensor([0] + problem_sizes, device=device), dim=0, dtype=torch.int32
         )
@@ -250,6 +253,19 @@ def bench_lora_with_sigma_op_impls(f, rank: int):
         l_sgmv = bench(
             lambda: punica.ops.add_lora_sgmv_custom_cutlass(
                 y, x, wa_ptr, wb_ptr, s, layer_idx=0, lora_rank=r
+            ),
+            warmup=200,
+            repeat=1000,
+        )
+        l_bgmv = bench(
+            lambda: punica.ops.add_lora_bgmv(
+                y,
+                x,
+                wa_t_all,
+                wb_t_all,
+                pair_indices_t,
+                layer_idx=0,
+                scale=1.0,
             ),
             warmup=200,
             repeat=1000,
@@ -274,6 +290,7 @@ def bench_lora_with_sigma_op_impls(f, rank: int):
             "setup": setup,
             "gbmm": dict(avg=l_gbmm.avg(), std=l_gbmm.std()),
             "sgmv": dict(avg=l_sgmv.avg(), std=l_sgmv.std()),
+            "bgmv": dict(avg=l_bgmv.avg(), std=l_bgmv.std()),
             "sigma_bgmv": dict(avg=l_sigma_bgmv.avg(), std=l_sigma_bgmv.std()),
         }
         f.write(json.dumps(result) + "\n")
@@ -385,7 +402,7 @@ def main():
 
     this_file = pathlib.Path(__file__)
     project_root = this_file.parents[1]
-    now = datetime.now(pytz.timezone("US/Pacific"))
+    now = datetime.now(pytz.timezone("US/Eastern"))
     suffix = "with_sigma" if args.with_sigma else this_file.stem
     out_filename = f"{now:%Y%m%d-%H%M%S}-{suffix}.jsonl.gz"
     out_path = project_root / "data" / out_filename

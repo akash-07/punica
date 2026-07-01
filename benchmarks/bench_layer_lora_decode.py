@@ -1,3 +1,4 @@
+import argparse
 import gzip
 import itertools
 import json
@@ -17,9 +18,14 @@ from punica import (
     KvPool,
     LlamaLoraWeight,
 )
-from punica.models.llama_lora import LlamaDecoderLayerWithLora
+from punica.models.llama_lora import (
+    BatchedLlamaSigmaLoraWeight,
+    LlamaDecoderLayerWithLora,
+    LlamaSigmaLoraWeight,
+)
 
 from .benchmark_utils import bench, gc_torch, get_lora_lens
+from .bench_lora_op_impls import _make_sigma_bgmv_layout
 
 
 class layer_lora_decode_Resources:
@@ -67,6 +73,81 @@ class layer_lora_decode_Resources:
             kvcache.release()
 
 
+class layer_sigma_lora_decode_Resources:
+    def __init__(
+        self,
+        config: LlamaConfig,
+        page_len: int,
+        lora_rank: int,
+        sigma_popularity: str,
+        num_clusters: int,
+        cluster_assignment: str,
+        seqlens: list[int],
+        dtype: torch.dtype,
+        device: torch.device,
+    ):
+        num_heads = config.num_attention_heads
+        head_dim = config.hidden_size // config.num_attention_heads
+        self.kvpool = KvPool(
+            num_layers=1,
+            num_heads=num_heads,
+            head_dim=head_dim,
+            page_len=page_len,
+            dtype=dtype,
+            device=device,
+        )
+        bs = len(seqlens)
+        self.hidden_states = torch.randn(
+            (bs, num_heads * head_dim), dtype=dtype, device=device
+        )
+        kv_list: list[KvCache] = []
+        for seqlen in seqlens:
+            kv_list.append(KvCache(self.kvpool, seqlen))
+        self.kv_list = kv_list
+        self.kv = BatchedKvCache(kv_list)
+        self.blen = BatchLenInfo([], bs, device)
+
+        (
+            cluster_indices,
+            sigma_indices,
+            problem_sizes,
+            _pairs,
+            sigma_lens,
+            clusters_in_use,
+        ) = (
+            _make_sigma_bgmv_layout(
+                bs=bs,
+                sigma_popularity=sigma_popularity,
+                num_clusters=num_clusters,
+                cluster_assignment=cluster_assignment,
+            )
+        )
+
+        num_sigma = len(sigma_lens)
+        self.num_sigma = num_sigma
+        self.num_clusters = num_clusters
+        self.clusters_in_use = clusters_in_use
+        self.num_problems = len(problem_sizes)
+        weight = LlamaSigmaLoraWeight(
+            config=config,
+            lora_rank=lora_rank,
+            num_clusters=num_clusters,
+            num_sigma=num_sigma,
+            dtype=dtype,
+            device=device,
+        )
+        self.lora = BatchedLlamaSigmaLoraWeight(
+            weight=weight,
+            cluster_indices=cluster_indices,
+            sigma_indices=sigma_indices,
+            device=device,
+        )
+
+    def release(self):
+        for kvcache in self.kv_list:
+            kvcache.release()
+
+
 @torch.inference_mode()
 def bench_layer_lora_decode(f):
     num_heads_ = [32, 40]
@@ -86,7 +167,8 @@ def bench_layer_lora_decode(f):
         )
     )
     last_num_heads = 0
-    for (num_heads, intermediate_size), pop, seqlen, batch_size in (pbar := tqdm(all_)):
+    pbar = tqdm(all_)
+    for (num_heads, intermediate_size), pop, seqlen, batch_size in pbar:
         if last_num_heads != num_heads:
             config = LlamaConfig(
                 hidden_size=num_heads * head_dim,
@@ -99,6 +181,7 @@ def bench_layer_lora_decode(f):
             with device:
                 model = LlamaDecoderLayerWithLora(config, layer_idx=0).to(device)
             torch.set_default_dtype(default_dtype)
+            last_num_heads = num_heads
 
         torch.manual_seed(0xABCDABCD987)
         gc_torch()
@@ -139,16 +222,120 @@ def bench_layer_lora_decode(f):
         f.flush()
 
 
+
+@torch.inference_mode()
+def bench_layer_sigma_lora_decode(f, rank: int):
+    num_heads_ = [32, 40]
+    # intermediate_size_ = [11008, 13824]
+    intermediate_size_ = [11008]
+    sigma_pop_ = ["bgmv", "bmm", "uniform", "zipf:1.5"]
+    num_clusters_ = [64]
+    batch_size_ = list(range(1, 65, 7))
+    # seqlen_ = list(reversed(range(2048, 0, -64)))
+    seqlen_ = [512]
+    dtype = torch.float16
+    device = torch.device("cuda:0")
+    page_len = 16
+    lora_rank = rank
+    head_dim = 128
+    cluster_assignment = "round_robin"
+
+    all_ = list(
+        itertools.product(
+            zip(num_heads_, intermediate_size_),
+            sigma_pop_,
+            num_clusters_,
+            seqlen_,
+            batch_size_,
+        )
+    )
+    last_num_heads = 0
+    pbar = tqdm(all_)
+    for (num_heads, intermediate_size), pop, num_clusters, seqlen, batch_size in pbar:
+        if last_num_heads != num_heads:
+            config = LlamaConfig(
+                hidden_size=num_heads * head_dim,
+                num_attention_heads=num_heads,
+                intermediate_size=intermediate_size,
+                num_hidden_layers=1,
+            )
+            default_dtype = torch.get_default_dtype()
+            torch.set_default_dtype(dtype)
+            with device:
+                model = LlamaDecoderLayerWithLora(config, layer_idx=0).to(device)
+            torch.set_default_dtype(default_dtype)
+            last_num_heads = num_heads
+
+        torch.manual_seed(0xABCDABCD987)
+        gc_torch()
+        res = layer_sigma_lora_decode_Resources(
+            config=config,
+            page_len=page_len,
+            lora_rank=lora_rank,
+            sigma_popularity=pop,
+            num_clusters=num_clusters,
+            cluster_assignment=cluster_assignment,
+            seqlens=[seqlen] * batch_size,
+            dtype=dtype,
+            device=device,
+        )
+        setup = dict(
+            num_heads=num_heads,
+            head_dim=head_dim,
+            intermediate_size=intermediate_size,
+            page_len=page_len,
+            lora_rank=lora_rank,
+            sigma_popularity=pop,
+            cluster_assignment=cluster_assignment,
+            num_sigma=res.num_sigma,
+            num_clusters=res.num_clusters,
+            clusters_in_use=res.clusters_in_use,
+            num_problems=res.num_problems,
+            seqlen=seqlen,
+            batch_size=batch_size,
+        )
+        pbar.set_postfix(setup)
+
+        latency = bench(
+            lambda: model(res.hidden_states, res.blen, None, res.kv, res.lora),
+            warmup=10,
+            repeat=50,
+        )
+        res.release()
+
+        result = {
+            "setup": setup,
+            "latency": {"avg": latency.avg(), "std": latency.std()},
+        }
+        f.write(json.dumps(result) + "\n")
+        f.flush()
+
+
 def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--with-sigma",
+        action="store_true",
+        help="benchmark Llama layer decode with U-Sigma-V LoRA weights",
+    )
+    parser.add_argument("--rank", type=int, default=16, help="LoRA rank to benchmark")
+    args = parser.parse_args()
+    if args.rank < 1:
+        raise SystemExit("--rank must be at least 1")
+
     this_file = pathlib.Path(__file__)
     project_root = this_file.parents[1]
-    now = datetime.now(pytz.timezone("US/Pacific"))
-    out_filename = f"{now:%Y%m%d-%H%M%S}-{this_file.stem}.jsonl.gz"
+    now = datetime.now(pytz.timezone("US/Eastern"))
+    suffix = "layer_sigma_lora_decode" if args.with_sigma else this_file.stem
+    out_filename = f"{now:%Y%m%d-%H%M%S}-{suffix}.jsonl.gz"
     out_path = project_root / "data" / out_filename
 
     print(out_path)
     with gzip.open(out_path, "wt") as f:
-        bench_layer_lora_decode(f)
+        if args.with_sigma:
+            bench_layer_sigma_lora_decode(f, rank=args.rank)
+        else:
+            bench_layer_lora_decode(f)
 
 
 if __name__ == "__main__":
